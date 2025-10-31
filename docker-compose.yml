@@ -1,0 +1,18 @@
+services:
+  web-scrcpy:
+    image: web-scrcpy-min:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: web-scrcpy
+    network_mode: host
+    restart: unless-stopped
+    privileged: true
+    environment:
+      - NODE_ENV=production
+      - PORT=8280
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

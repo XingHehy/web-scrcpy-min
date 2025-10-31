@@ -1,0 +1,9 @@
+node_modules/
+*.log
+npm-debug.log*
+temp-*.mp4
+temp-*.mkv
+
+adb-keys/
+*.adbkey
+*.adbkey.pub

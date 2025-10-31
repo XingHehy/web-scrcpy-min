@@ -1,0 +1,26 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+README.md
+.env
+.DS_Store
+*.log
+.vscode
+.idea
+
+# 文档和辅助脚本（不需要打包到镜像）
+import-keys.sh
+adb-keys-export/
+adb-keys-backup/
+
+# 注意：adb-keys/ 目录需要打包到镜像，所以不要忽略
+
+# Docker 相关（避免递归）
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# 临时文件
+*.tar
+*.zip
