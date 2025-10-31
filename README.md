@@ -4,6 +4,11 @@ scrcpy使用的是 [Genymobile/scrcpy][scrcpy] 的修改版 [NetrisTV/scrcpy][Ne
 
 [scrcpy]: https://github.com/Genymobile/scrcpy
 [NetrisTV_scrcpy]: https://github.com/NetrisTV/scrcpy/tree/feature/websocket-v1.19.x
+
+## 演示效果
+
+![web-scrcpy演示效果](https://github.com/XingHehy/web-scrcpy-min/blob/main/web-scrcpy-demo.gif)
+
 ## 🚀 快速部署
 
 ### 方案 1：使用本机密钥（推荐）⭐
@@ -108,4 +113,3 @@ docker exec web-scrcpy ls -la /root/.android/
 - `docker-entrypoint.sh` - Docker 启动脚本（自动生成密钥）
 - `Dockerfile` - Docker 镜像定义
 - `docker-compose.yml` - Docker 编排配置
-
