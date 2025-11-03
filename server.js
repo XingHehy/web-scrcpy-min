@@ -175,7 +175,10 @@ class ScrcpyClient {
     this.localPort = 27183 + Math.floor(Math.random() * 1000);
     this.screenWidth = 0;
     this.screenHeight = 0;
+    this.videoWidth = 0; // 实际视频流宽度（缩放后）
+    this.videoHeight = 0; // 实际视频流高度（缩放后）
     this.onDisconnect = null; // 断开回调
+    this.lastSps = null; // 用于检测配置变化（横竖屏切换）
   }
 
   async start() {
@@ -192,14 +195,117 @@ class ScrcpyClient {
     }
   }
 
+  // 检测配置变化（横竖屏切换）
+  detectConfigurationChange(buffer) {
+    // 查找 SPS NAL unit (type 7: 0x67)
+    for (let i = 0; i < buffer.length - 5; i++) {
+      if (buffer[i] === 0 && buffer[i + 1] === 0 &&
+        buffer[i + 2] === 0 && buffer[i + 3] === 1) {
+        const nalType = buffer[i + 4] & 0x1F;
+
+        if (nalType === 7) { // SPS
+          // 提取 SPS 数据用于比较
+          let spsEnd = i + 5;
+          for (let j = i + 5; j < buffer.length - 3; j++) {
+            if (buffer[j] === 0 && buffer[j + 1] === 0 && buffer[j + 2] === 0) {
+              spsEnd = j;
+              break;
+            }
+          }
+
+          const currentSps = buffer.slice(i + 4, spsEnd);
+
+          // 如果没有记录过 SPS，或者 SPS 发生变化
+          if (!this.lastSps || !currentSps.equals(this.lastSps)) {
+            if (this.lastSps) {
+              log("INFO", "⚠️ SPS changed - Screen rotation detected!");
+
+              // 异步获取新的屏幕尺寸
+              this.updateScreenSizeAfterRotation();
+            }
+            this.lastSps = Buffer.from(currentSps);
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  // 横竖屏切换后更新屏幕尺寸
+  async updateScreenSizeAfterRotation() {
+    try {
+      // 等待一小段时间，确保设备完成旋转
+      await new Promise(resolve => setTimeout(resolve, 300));
+
+      log("INFO", "Fetching new screen size after rotation...");
+      const sizeProc = spawn("adb", ["-s", this.deviceId, "shell", "wm", "size"]);
+      let sizeOutput = "";
+
+      sizeProc.stdout.on("data", (data) => {
+        sizeOutput += data.toString();
+      });
+
+      sizeProc.on("close", () => {
+        const match = sizeOutput.match(/(\d+)x(\d+)/);
+        if (match) {
+          const newWidth = parseInt(match[1]);
+          const newHeight = parseInt(match[2]);
+
+          // 检查分辨率是否真的变了
+          if (newWidth !== this.screenWidth || newHeight !== this.screenHeight) {
+            const oldWidth = this.screenWidth;
+            const oldHeight = this.screenHeight;
+
+            this.screenWidth = newWidth;
+            this.screenHeight = newHeight;
+
+            // 更新视频流分辨率（按比例计算）
+            // 视频流分辨率 = 物理分辨率 * (maxSize / 短边)
+            const shortEdge = Math.min(this.screenWidth, this.screenHeight);
+            const scale = this.maxSize / shortEdge;
+
+            this.videoWidth = Math.round(this.screenWidth * scale / Math.max(this.screenWidth / shortEdge, this.screenHeight / shortEdge));
+            this.videoHeight = Math.round(this.screenHeight * scale / Math.max(this.screenWidth / shortEdge, this.screenHeight / shortEdge));
+
+            // 简化：直接按短边缩放
+            if (this.screenWidth > this.screenHeight) {
+              // 横屏
+              this.videoWidth = Math.round(this.screenWidth * this.maxSize / this.screenHeight);
+              this.videoHeight = this.maxSize;
+            } else {
+              // 竖屏
+              this.videoWidth = this.maxSize;
+              this.videoHeight = Math.round(this.screenHeight * this.maxSize / this.screenWidth);
+            }
+
+            log("INFO", `Screen rotated! ${oldWidth}x${oldHeight} -> ${this.screenWidth}x${this.screenHeight}`);
+            log("INFO", `Estimated video size: ${this.videoWidth}x${this.videoHeight} (actual size will be determined by scrcpy)`);
+
+            // 通知前端需要重新配置
+            // 注意：实际的视频流分辨率会由前端从 SPS/PPS 和视频帧中获取
+            if (this.ws && this.ws.readyState === this.ws.OPEN) {
+              this.ws.send(JSON.stringify({
+                type: "screenSize",
+                width: this.videoWidth,
+                height: this.videoHeight,
+              }));
+              log("INFO", "Sent rotation notification to client");
+            }
+          }
+        }
+      });
+    } catch (err) {
+      log("ERROR", `Failed to update screen size after rotation: ${err.message}`);
+    }
+  }
+
   // H264 视频流模式
   async startH264Stream() {
     log("INFO", "Starting H264 video stream...");
     log("INFO", `Using local port: ${this.localPort}`);
     log(
       "INFO",
-      `User settings: Bitrate=${this.bitrate / 1000000} Mbps, Resolution=${
-        this.maxSize
+      `User settings: Bitrate=${this.bitrate / 1000000} Mbps, Resolution=${this.maxSize
       }p (short edge), FPS=${this.maxFps}`
     );
     log("INFO", `If stream doesn't start automatically, try accessing:`);
@@ -249,19 +355,11 @@ class ScrcpyClient {
           this.screenHeight = parseInt(match[2]);
           log(
             "INFO",
-            `Screen size from ADB: ${this.screenWidth}x${this.screenHeight}`
+            `Physical screen size from ADB: ${this.screenWidth}x${this.screenHeight} (used for resolution calculation)`
           );
 
-          // 立即发送给客户端
-          if (this.ws.readyState === this.ws.OPEN) {
-            this.ws.send(
-              JSON.stringify({
-                type: "screenSize",
-                width: this.screenWidth,
-                height: this.screenHeight,
-              })
-            );
-          }
+          // 不在这里发送给客户端，等解析 scrcpy 头部后再发送实际视频流分辨率
+          // 因为用户可能选择了缩放（如 480p），实际视频流会比物理分辨率小
         } else {
           log("WARN", "Could not get screen size from ADB");
         }
@@ -387,6 +485,14 @@ class ScrcpyClient {
           "INFO",
           `Resolution calculation: ${this.screenWidth}x${this.screenHeight} -> short:${this.maxSize} -> long:${calculatedMaxSize}`
         );
+      } else {
+        // 如果还没有获取到屏幕尺寸，假设是标准 9:16 或 16:9 比例
+        // 对于竖屏设备（最常见）：短边:长边 ≈ 9:16
+        calculatedMaxSize = Math.round(this.maxSize * (16 / 9));
+        log(
+          "WARN",
+          `Screen size not available, using estimated maxSize: ${calculatedMaxSize} (assuming 9:16 aspect ratio)`
+        );
       }
 
       const params = [
@@ -411,6 +517,16 @@ class ScrcpyClient {
       const cmd = `CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / com.genymobile.scrcpy.Server ${params.join(
         " "
       )}`;
+
+      // 打印完整的 scrcpy 参数用于调试
+      log("INFO", "═══════════════════════════════════════");
+      log("INFO", "Starting scrcpy-server with parameters:");
+      log("INFO", `  Version: ${SERVER_VERSION}`);
+      log("INFO", `  Max Size (long edge): ${calculatedMaxSize}px`);
+      log("INFO", `  Bitrate: ${(this.bitrate / 1000000).toFixed(1)} Mbps`);
+      log("INFO", `  Max FPS: ${this.maxFps}`);
+      log("INFO", `  User Selection: ${this.maxSize}p / ${(this.bitrate / 1000000)} Mbps / ${this.maxFps} FPS`);
+      log("INFO", "═══════════════════════════════════════");
 
       this.serverProcess = spawn("adb", ["-s", this.deviceId, "shell", cmd]);
 
@@ -466,8 +582,7 @@ class ScrcpyClient {
 
         log(
           "INFO",
-          `Attempting to connect to localhost:${this.localPort} (attempt ${
-            retryCount + 1
+          `Attempting to connect to localhost:${this.localPort} (attempt ${retryCount + 1
           }/${maxRetries})...`
         );
 
@@ -537,54 +652,71 @@ class ScrcpyClient {
               .toString("utf8")
               .replace(/\0.*$/g, "");
 
-            // 只在还没有屏幕尺寸时才从头部解析
+            // **关键修复：总是从 scrcpy 头部解析视频流分辨率**
+            // 头部的分辨率是缩放后的实际视频流分辨率，不是物理分辨率
+            // 注意：scrcpy 在位置 64 有一个填充字节，实际数据从 65 开始
+            const widthBE = buffer.readUInt16BE(65);   // 从 65 开始，不是 64
+            const heightBE = buffer.readUInt16BE(67);  // 从 67 开始，不是 66
+            const widthLE = buffer.readUInt16LE(65);
+            const heightLE = buffer.readUInt16LE(67);
+
+            log("DEBUG", `Header resolution - Width BE: ${widthBE}, LE: ${widthLE}`);
+            log("DEBUG", `Header resolution - Height BE: ${heightBE}, LE: ${heightLE}`);
+
+            // 解析实际视频流分辨率（从 scrcpy 头部）
+            let parsedVideoWidth = 0;
+            let parsedVideoHeight = 0;
+
             if (
-              !this.screenWidth ||
-              !this.screenHeight ||
-              this.screenWidth < 100 ||
-              this.screenHeight < 100
+              widthBE > 100 &&
+              widthBE < 5000 &&
+              heightBE > 100 &&
+              heightBE < 5000
             ) {
-              // 尝试两种字节序
-              const widthBE = buffer.readUInt16BE(64);
-              const heightBE = buffer.readUInt16BE(66);
-              const widthLE = buffer.readUInt16LE(64);
-              const heightLE = buffer.readUInt16LE(66);
-
-              log("DEBUG", `Width BE: ${widthBE}, LE: ${widthLE}`);
-              log("DEBUG", `Height BE: ${heightBE}, LE: ${heightLE}`);
-
-              // 使用更合理的值
-              if (
-                widthBE > 100 &&
-                widthBE < 5000 &&
-                heightBE > 100 &&
-                heightBE < 5000
-              ) {
-                this.screenWidth = widthBE;
-                this.screenHeight = heightBE;
-              } else if (
-                widthLE > 100 &&
-                widthLE < 5000 &&
-                heightLE > 100 &&
-                heightLE < 5000
-              ) {
-                this.screenWidth = widthLE;
-                this.screenHeight = heightLE;
-              } else {
-                log("WARN", "Invalid screen size from header");
-              }
+              parsedVideoWidth = widthBE;
+              parsedVideoHeight = heightBE;
+              log("INFO", `Using Big Endian byte order for video resolution`);
+            } else if (
+              widthLE > 100 &&
+              widthLE < 5000 &&
+              heightLE > 100 &&
+              heightLE < 5000
+            ) {
+              parsedVideoWidth = widthLE;
+              parsedVideoHeight = heightLE;
+              log("INFO", `Using Little Endian byte order for video resolution`);
             } else {
-              log(
-                "INFO",
-                `Using pre-fetched screen size: ${this.screenWidth}x${this.screenHeight}`
-              );
+              log("WARN", "Invalid video resolution from scrcpy header");
             }
 
-            const codecByte = buffer[68];
+            // 如果还没有物理分辨率，使用头部的值作为备用
+            if (!this.screenWidth || !this.screenHeight) {
+              this.screenWidth = parsedVideoWidth;
+              this.screenHeight = parsedVideoHeight;
+              log("INFO", `Physical screen size not available, using video resolution as fallback`);
+            }
+
+            // **视频流分辨率总是从 scrcpy 头部获取（这是缩放后的值）**
+            this.videoWidth = parsedVideoWidth;
+            this.videoHeight = parsedVideoHeight;
+
+            // Codec 字节在不同版本的 scrcpy 中位置可能不同
+            // 尝试从多个位置读取
+            let codecByte;
+            if (buffer.length > 69) {
+              codecByte = buffer[69];
+            } else if (buffer.length > 68) {
+              codecByte = buffer[68];
+            }
 
             log("INFO", `Device: ${deviceName}`);
-            log("INFO", `Screen: ${this.screenWidth}x${this.screenHeight}`);
-            log("INFO", `Codec: 0x${codecByte.toString(16)}`);
+            log("INFO", `Physical Screen: ${this.screenWidth}x${this.screenHeight}`);
+            log("INFO", `Video Stream (actual): ${this.videoWidth}x${this.videoHeight}`);
+            if (codecByte !== undefined) {
+              log("INFO", `Codec: 0x${codecByte.toString(16)}`);
+            } else {
+              log("INFO", `Codec: unknown (buffer length: ${buffer.length})`);
+            }
 
             if (
               this.ws.readyState === this.ws.OPEN &&
@@ -594,13 +726,14 @@ class ScrcpyClient {
               this.ws.send(
                 JSON.stringify({
                   type: "screenSize",
-                  width: this.screenWidth,
-                  height: this.screenHeight,
+                  width: this.videoWidth,  // 发送实际视频流分辨率
+                  height: this.videoHeight,
                 })
               );
             }
 
             headerParsed = true;
+            // scrcpy 头部是 69 字节（0-68），从 69 开始是视频数据
             buffer = buffer.slice(69);
             log("INFO", "Header parsed, streaming H264 data...");
 
@@ -609,6 +742,11 @@ class ScrcpyClient {
               buffer = Buffer.alloc(0);
             }
           } else if (headerParsed) {
+            // 检测视频流中的配置变化（横竖屏切换）
+            // SPS NAL unit: 0x00 0x00 0x00 0x01 0x67 (type 7)
+            // PPS NAL unit: 0x00 0x00 0x00 0x01 0x68 (type 8)
+            this.detectConfigurationChange(buffer);
+
             if (this.ws.readyState === this.ws.OPEN) {
               this.ws.send(buffer);
             }
@@ -620,8 +758,7 @@ class ScrcpyClient {
           if (err.code === "ECONNREFUSED") {
             log(
               "WARN",
-              `Connection refused (attempt ${
-                retryCount + 1
+              `Connection refused (attempt ${retryCount + 1
               }/${maxRetries}), scrcpy-server may not be ready yet`
             );
 
@@ -842,7 +979,7 @@ wss.on("connection", (ws) => {
           ws.send(JSON.stringify({ type: "error", message: "未授权的操作" }));
           return;
         }
-        const { x, y } = data;
+        const { x, y, duration } = data; // 支持长按（duration参数）
         if (scrcpyClient) {
           // 如果屏幕尺寸未知，尝试获取
           if (!scrcpyClient.screenWidth || !scrcpyClient.screenHeight) {
@@ -880,30 +1017,45 @@ wss.on("connection", (ws) => {
               if (match) {
                 scrcpyClient.screenWidth = parseInt(match[1]);
                 scrcpyClient.screenHeight = parseInt(match[2]);
+
                 log(
                   "INFO",
-                  `Screen size fetched: ${scrcpyClient.screenWidth}x${scrcpyClient.screenHeight}`
+                  `Physical screen size fetched: ${scrcpyClient.screenWidth}x${scrcpyClient.screenHeight}`
                 );
 
-                // 执行点击
+                // 执行点击（使用物理屏幕分辨率）
                 const actualX = Math.round(x * scrcpyClient.screenWidth);
                 const actualY = Math.round(y * scrcpyClient.screenHeight);
                 log(
                   "INFO",
                   `Touch: (${x.toFixed(2)}, ${y.toFixed(
                     2
-                  )}) -> (${actualX}, ${actualY})`
+                  )}) -> (${actualX}, ${actualY}) [Physical: ${scrcpyClient.screenWidth}x${scrcpyClient.screenHeight}, Video: ${scrcpyClient.videoWidth}x${scrcpyClient.videoHeight}]`
                 );
 
-                const tapCmd = spawn("adb", [
-                  "-s",
-                  scrcpyClient.deviceId,
-                  "shell",
-                  "input",
-                  "tap",
-                  actualX.toString(),
-                  actualY.toString(),
-                ]);
+                // 支持长按
+                const tapCmd = duration
+                  ? spawn("adb", [
+                    "-s",
+                    scrcpyClient.deviceId,
+                    "shell",
+                    "input",
+                    "swipe",
+                    actualX.toString(),
+                    actualY.toString(),
+                    actualX.toString(),
+                    actualY.toString(),
+                    duration.toString(),
+                  ])
+                  : spawn("adb", [
+                    "-s",
+                    scrcpyClient.deviceId,
+                    "shell",
+                    "input",
+                    "tap",
+                    actualX.toString(),
+                    actualY.toString(),
+                  ]);
                 tapCmd.stderr.on("data", (data) => {
                   const error = data.toString();
                   if (
@@ -919,26 +1071,40 @@ wss.on("connection", (ws) => {
             return;
           }
 
+          // 使用物理屏幕分辨率计算坐标
           const actualX = Math.round(x * scrcpyClient.screenWidth);
           const actualY = Math.round(y * scrcpyClient.screenHeight);
           log(
             "INFO",
             `Touch: (${x.toFixed(2)}, ${y.toFixed(
               2
-            )}) -> (${actualX}, ${actualY}) [Screen: ${
-              scrcpyClient.screenWidth
-            }x${scrcpyClient.screenHeight}]`
+            )}) -> (${actualX}, ${actualY}) [Physical: ${scrcpyClient.screenWidth
+            }x${scrcpyClient.screenHeight}, Video: ${scrcpyClient.videoWidth}x${scrcpyClient.videoHeight}]${duration ? ` Long press: ${duration}ms` : ''}`
           );
 
-          const cmd = spawn("adb", [
-            "-s",
-            scrcpyClient.deviceId,
-            "shell",
-            "input",
-            "tap",
-            actualX.toString(),
-            actualY.toString(),
-          ]);
+          // 支持长按：使用 swipe 命令在同一位置停留指定时间
+          const cmd = duration
+            ? spawn("adb", [
+              "-s",
+              scrcpyClient.deviceId,
+              "shell",
+              "input",
+              "swipe",
+              actualX.toString(),
+              actualY.toString(),
+              actualX.toString(),
+              actualY.toString(),
+              duration.toString(),
+            ])
+            : spawn("adb", [
+              "-s",
+              scrcpyClient.deviceId,
+              "shell",
+              "input",
+              "tap",
+              actualX.toString(),
+              actualY.toString(),
+            ]);
 
           cmd.stderr.on("data", (data) => {
             const error = data.toString();
@@ -963,19 +1129,20 @@ wss.on("connection", (ws) => {
         }
         const { x1, y1, x2, y2, duration } = data;
         if (scrcpyClient) {
-          // 如果屏幕尺寸未知，使用默认值或跳过
+          // 如果屏幕尺寸未知，跳过
           if (!scrcpyClient.screenWidth || !scrcpyClient.screenHeight) {
             log("WARN", "Screen size not available for swipe, skipping...");
             return;
           }
 
+          // 使用物理屏幕分辨率
           const actualX1 = Math.round(x1 * scrcpyClient.screenWidth);
           const actualY1 = Math.round(y1 * scrcpyClient.screenHeight);
           const actualX2 = Math.round(x2 * scrcpyClient.screenWidth);
           const actualY2 = Math.round(y2 * scrcpyClient.screenHeight);
           log(
             "INFO",
-            `Swipe: (${actualX1}, ${actualY1}) -> (${actualX2}, ${actualY2}), ${duration}ms`
+            `Swipe: (${actualX1}, ${actualY1}) -> (${actualX2}, ${actualY2}), ${duration}ms [Physical: ${scrcpyClient.screenWidth}x${scrcpyClient.screenHeight}, Video: ${scrcpyClient.videoWidth}x${scrcpyClient.videoHeight}]`
           );
 
           const cmd = spawn("adb", [
@@ -1037,6 +1204,144 @@ wss.on("connection", (ws) => {
 
           cmd.on("error", (err) =>
             log("ERROR", `Key command error: ${err.message}`)
+          );
+        }
+      }
+      // 文本输入
+      else if (data.action === "text") {
+        if (!isAuthenticated) {
+          log("WARNING", "Unauthorized text input attempt");
+          ws.send(JSON.stringify({ type: "error", message: "未授权的操作" }));
+          return;
+        }
+        const { text } = data;
+        if (scrcpyClient && text) {
+          log("INFO", `Text input: ${text}`);
+          // 转义特殊字符
+          const escapedText = text
+            .replace(/\\/g, "\\\\")
+            .replace(/"/g, '\\"')
+            .replace(/'/g, "\\'")
+            .replace(/`/g, "\\`")
+            .replace(/\$/g, "\\$")
+            .replace(/\(/g, "\\(")
+            .replace(/\)/g, "\\)")
+            .replace(/</g, "\\<")
+            .replace(/>/g, "\\>")
+            .replace(/&/g, "\\&")
+            .replace(/;/g, "\\;")
+            .replace(/\|/g, "\\|")
+            .replace(/\*/g, "\\*")
+            .replace(/\?/g, "\\?")
+            .replace(/~/g, "\\~")
+            .replace(/!/g, "\\!")
+            .replace(/#/g, "\\#")
+            .replace(/%/g, "\\%");
+
+          const cmd = spawn("adb", [
+            "-s",
+            scrcpyClient.deviceId,
+            "shell",
+            "input",
+            "text",
+            escapedText,
+          ]);
+
+          cmd.stderr.on("data", (data) => {
+            const error = data.toString();
+            if (
+              error.includes("device offline") ||
+              error.includes("device not found")
+            ) {
+              log("ERROR", `Device ${scrcpyClient.deviceId} is offline`);
+              ws.send(JSON.stringify({ type: "ended" }));
+            }
+          });
+
+          cmd.on("error", (err) =>
+            log("ERROR", `Text input error: ${err.message}`)
+          );
+        }
+      }
+      // 获取剪贴板
+      else if (data.action === "getClipboard") {
+        if (!isAuthenticated) {
+          log("WARNING", "Unauthorized clipboard access attempt");
+          ws.send(JSON.stringify({ type: "error", message: "未授权的操作" }));
+          return;
+        }
+        if (scrcpyClient) {
+          log("INFO", "Getting clipboard from device");
+          const cmd = spawn("adb", [
+            "-s",
+            scrcpyClient.deviceId,
+            "shell",
+            "cmd",
+            "clipboard",
+            "get-text",
+          ]);
+
+          let clipboardText = "";
+          cmd.stdout.on("data", (data) => {
+            clipboardText += data.toString();
+          });
+
+          cmd.on("close", (code) => {
+            if (code === 0 && clipboardText) {
+              log("INFO", `Clipboard content: ${clipboardText.substring(0, 50)}...`);
+              ws.send(
+                JSON.stringify({
+                  type: "clipboard",
+                  text: clipboardText.trim(),
+                })
+              );
+            } else {
+              log("WARN", "Failed to get clipboard or clipboard is empty");
+            }
+          });
+
+          cmd.on("error", (err) =>
+            log("ERROR", `Get clipboard error: ${err.message}`)
+          );
+        }
+      }
+      // 设置剪贴板
+      else if (data.action === "setClipboard") {
+        if (!isAuthenticated) {
+          log("WARNING", "Unauthorized clipboard access attempt");
+          ws.send(JSON.stringify({ type: "error", message: "未授权的操作" }));
+          return;
+        }
+        const { text } = data;
+        if (scrcpyClient && text) {
+          log("INFO", `Setting clipboard: ${text.substring(0, 50)}...`);
+          // 使用 echo 和管道设置剪贴板
+          const cmd = spawn("adb", [
+            "-s",
+            scrcpyClient.deviceId,
+            "shell",
+            `echo -n "${text.replace(/"/g, '\\"')}" | cmd clipboard put-text`,
+          ]);
+
+          cmd.stderr.on("data", (data) => {
+            const error = data.toString();
+            if (
+              error.includes("device offline") ||
+              error.includes("device not found")
+            ) {
+              log("ERROR", `Device ${scrcpyClient.deviceId} is offline`);
+              ws.send(JSON.stringify({ type: "ended" }));
+            }
+          });
+
+          cmd.on("close", (code) => {
+            if (code === 0) {
+              log("INFO", "Clipboard set successfully");
+            }
+          });
+
+          cmd.on("error", (err) =>
+            log("ERROR", `Set clipboard error: ${err.message}`)
           );
         }
       }
