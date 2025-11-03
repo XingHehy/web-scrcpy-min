@@ -45,7 +45,9 @@ RUN if [ -d "./adb-keys" ] && [ -f "./adb-keys/adbkey" ]; then \
 
 # 复制并设置启动脚本权限
 COPY docker-entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+# 转换 Windows 行尾 (CRLF) 到 Linux 行尾 (LF)
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh && \
+    chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # 暴露端口 (虽然使用 host 模式，但保留作为文档说明)
 EXPOSE 8280
