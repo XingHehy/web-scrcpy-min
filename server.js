@@ -27,11 +27,11 @@ function log(level, message) {
 }
 
 const app = express();
-const PORT = 8280;
+const PORT = process.env.PORT || 8280;
 const SCRCPY_SERVER_PATH = path.join(__dirname, "scrcpy-server.jar");
 const SERVER_VERSION = "1.19-ws6";
 
-const ACCESS_PASSWORD = "123456";
+const ACCESS_PASSWORD = process.env.ACCESS_PASSWORD || "123456";
 
 // 简单的 session 存储
 const sessions = new Map();
